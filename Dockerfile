@@ -1,27 +1,24 @@
-# Usa Python 3.10 (estável p/ numpy/xgboost/shap)
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# libs nativas (xgboost/numba/matplotlib)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# instala deps a partir do requirements que está em streamlit/
-COPY streamlit/requirements.txt ./requirements.txt
+# ⬇️ Aqui com S maiúsculo
+COPY Streamlit/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# agora copia TODO o repo (inclui Dados/ e Modelos/)
+# copia TUDO (inclui Dados/ e Modelos/)
 COPY . .
 
-# entra na pasta onde está o app
-WORKDIR /app/streamlit
+# entra na pasta do app (S maiúsculo)
+WORKDIR /app/Streamlit
 
-# variáveis básicas do streamlit
 ENV PORT=8501 \
     STREAMLIT_SERVER_PORT=$PORT \
     STREAMLIT_SERVER_HEADLESS=true \
@@ -30,4 +27,4 @@ ENV PORT=8501 \
 
 EXPOSE $PORT
 
-CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["streamlit","run","streamlit_app.py","--server.address=0.0.0.0","--server.port=8501"]
