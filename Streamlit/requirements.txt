@@ -6,4 +6,5 @@ Faker==37.6.0
 matplotlib==3.10.6
 shap==0.42.1
 numba==0.57.1
-azure-storage-blob
+pyarrow==14.0.2
+azure-storage-blob==12.27.1
