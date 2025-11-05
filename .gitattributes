@@ -1,6 +1,0 @@
-*.parquet filter=lfs diff=lfs merge=lfs -text
-Dados/cb_previsao_data.parquet filter=lfs diff=lfs merge=lfs -text
-Dados/cb_previsao_trecho.parquet filter=lfs diff=lfs merge=lfs -text
-Dados/classes.parquet filter=lfs diff=lfs merge=lfs -text
-Dados/dataframe.parquet filter=lfs diff=lfs merge=lfs -text
-*.json filter=lfs diff=lfs merge=lfs -text
