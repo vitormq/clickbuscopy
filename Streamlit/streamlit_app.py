@@ -1,196 +1,294 @@
-# Streamlit/streamlit_app.py
-import os
-import gc
-import datetime
+# -*- coding: utf-8 -*-
+"""
+Previsão de Próxima Compra por Cliente
+- Auto-start (sem botão)
+- Cache de dados e modelos (menos RAM / mais rápido)
+- Caminhos robustos (roda local, Render, Streamlit Cloud)
+- Tratamento de erros (arquivos ausentes, SHAP sem memória)
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from pathlib import Path
 import random
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import xgboost as xgb
-import pyarrow.parquet as pq
 from faker import Faker
-from matplotlib import pyplot as plt
+import xgboost as xgb
 
-st.set_page_config(page_title="Previsão de Próxima Compra", layout="wide")
+# SHAP é pesado; importamos sob try para poder degradar se faltar memória
+try:
+    import shap  # noqa: F401
+    _HAS_SHAP = True
+except Exception:
+    _HAS_SHAP = False
+
+# -----------------------------------------------------------------------------
+# Config de página
+# -----------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Previsão de Próxima Compra",
+    page_icon="🧭",
+    layout="wide",
+)
+
 st.title("Previsão de Próxima Compra por Cliente")
 
-# ============
-# BASE DE PATH
-# ============
-# Garante que "Dados/..." e "Modelos/..." sejam resolvidos a partir da pasta do arquivo,
-# mesmo que o WORKDIR do Docker seja /app ou /app/Streamlit.
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DADOS_DIR = os.path.join(BASE_DIR, "Dados")
-MODELOS_DIR = os.path.join(BASE_DIR, "Modelos")
+# -----------------------------------------------------------------------------
+# Caminhos (sempre relativos a este arquivo)
+# -----------------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "Dados"
+MODELOS_DIR = BASE_DIR / "Modelos"
 
-def _must_exist(path: str):
-    if not os.path.exists(path):
-        st.error(f"Arquivo não encontrado: `{path}`. "
-                 f"Confirme se o arquivo está no repositório e no caminho correto.")
+# Arquivos esperados
+ARQ_DATAFRAME = DATA_DIR / "dataframe.parquet"
+ARQ_DIA = DATA_DIR / "cb_previsao_data.parquet"
+ARQ_TRECHO = DATA_DIR / "cb_previsao_trecho.parquet"
+ARQ_CLASSES = DATA_DIR / "classes.parquet"
+ARQ_MODEL_DIA = MODELOS_DIR / "xgboost_model_dia_exato.json"
+ARQ_MODEL_TRECHO = MODELOS_DIR / "xgboost_model_trecho.json"
+
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
+def _check_exists(p: Path, label: str) -> None:
+    if not p.exists():
+        st.error(
+            f"Arquivo não encontrado: `{p}`.\n\n"
+            f"→ Confirme se ele está no repositório no caminho **{label}**.",
+            icon="🚫",
+        )
         st.stop()
 
-# ===============
-# CACHES / LOADERS
-# ===============
-@st.cache_resource(show_spinner=False)
-def carregar_modelos():
-    p1 = os.path.join(MODELOS_DIR, "xgboost_model_dia_exato.json")
-    p2 = os.path.join(MODELOS_DIR, "xgboost_model_trecho.json")
-    _must_exist(p1); _must_exist(p2)
-    m1 = xgb.Booster(); m1.load_model(p1)
-    m2 = xgb.Booster(); m2.load_model(p2)
-    return m1, m2
 
-@st.cache_data(show_spinner=False)
-def listar_clientes():
-    p = os.path.join(DADOS_DIR, "cb_previsao_trecho.parquet")
-    _must_exist(p)
-    tbl = pq.read_table(p, columns=["id_cliente"])
-    ids = pd.Series(tbl.column("id_cliente").to_numpy()).drop_duplicates().sort_values().tolist()
-    return ids
+# -----------------------------------------------------------------------------
+# Carregamento de dados e modelos (com cache)
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=True, ttl=3600)
+def carregar_dados() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Carrega dataframes parquet com cache."""
+    for p, label in [
+        (ARQ_DATAFRAME, "Streamlit/Dados/dataframe.parquet"),
+        (ARQ_DIA, "Streamlit/Dados/cb_previsao_data.parquet"),
+        (ARQ_TRECHO, "Streamlit/Dados/cb_previsao_trecho.parquet"),
+        (ARQ_CLASSES, "Streamlit/Dados/classes.parquet"),
+    ]:
+        _check_exists(p, label)
 
-@st.cache_data(show_spinner=False)
-def carregar_classes_slim():
-    p = os.path.join(DADOS_DIR, "classes.parquet")
-    _must_exist(p)
-    tbl = pq.read_table(p, columns=["Trechos"])
-    return tbl.to_pandas()
+    df_compras = pd.read_parquet(ARQ_DATAFRAME, engine="pyarrow")
+    features_dia = pd.read_parquet(ARQ_DIA, engine="pyarrow")
+    features_trecho = pd.read_parquet(ARQ_TRECHO, engine="pyarrow")
+    classes = pd.read_parquet(ARQ_CLASSES, engine="pyarrow")
+    return df_compras, features_dia, features_trecho, classes
 
-@st.cache_data(show_spinner=False)
-def carregar_features_cliente(id_cliente: int):
-    p_dia = os.path.join(DADOS_DIR, "cb_previsao_data.parquet")
-    p_tre = os.path.join(DADOS_DIR, "cb_previsao_trecho.parquet")
-    _must_exist(p_dia); _must_exist(p_tre)
-    t_dia = pq.read_table(p_dia, filters=[("id_cliente", "=", id_cliente)])
-    t_tre = pq.read_table(p_tre, filters=[("id_cliente", "=", id_cliente)])
-    f_dia = t_dia.to_pandas(); f_tre = t_tre.to_pandas()
-    del t_dia, t_tre; gc.collect()
-    return f_dia, f_tre
 
-@st.cache_data(show_spinner=False)
-def carregar_compras_cliente(id_cliente: int):
-    p = os.path.join(DADOS_DIR, "dataframe.parquet")
-    _must_exist(p)
-    cols = [
-        "id_cliente","origem_ida","destino_ida",
-        "qtd_total_compras","intervalo_medio_dias",
-        "vl_medio_compra","cluster_name","data_compra"
-    ]
-    t = pq.read_table(p, columns=cols, filters=[("id_cliente", "=", id_cliente)])
-    df = t.to_pandas()
-    del t; gc.collect()
-    return df
+@st.cache_resource(show_spinner=True)
+def carregar_modelos() -> tuple[xgb.Booster, xgb.Booster]:
+    """Carrega modelos XGBoost com cache de recurso (mantém 1 cópia na RAM)."""
+    for p, label in [
+        (ARQ_MODEL_DIA, "Streamlit/Modelos/xgboost_model_dia_exato.json"),
+        (ARQ_MODEL_TRECHO, "Streamlit/Modelos/xgboost_model_trecho.json"),
+    ]:
+        _check_exists(p, label)
 
-# =========
-# UTILIDADES
-# =========
-def gerar_mapeamento_cidades(df_compras_cliente):
-    Faker.seed(42); fake = Faker("pt_BR")
-    todos_ids = set()
-    pares = (df_compras_cliente["origem_ida"].astype(str) +
-             "_" + df_compras_cliente["destino_ida"].astype(str))
-    for item in pares:
+    model_dia = xgb.Booster()
+    model_trecho = xgb.Booster()
+    model_dia.load_model(str(ARQ_MODEL_DIA))
+    model_trecho.load_model(str(ARQ_MODEL_TRECHO))
+    return model_dia, model_trecho
+
+
+# -----------------------------------------------------------------------------
+# Carrega tudo (autostart)
+# -----------------------------------------------------------------------------
+with st.spinner("🔄 Carregando dados e modelos..."):
+    df_compras, features_dia, features_trecho, classes = carregar_dados()
+    model_dia, model_trecho = carregar_modelos()
+
+st.success("✅ Dados e modelos carregados.")
+
+# -----------------------------------------------------------------------------
+# Nomes fake (determinísticos)
+# -----------------------------------------------------------------------------
+Faker.seed(42)
+fake = Faker("pt_BR")
+
+if "id_cliente" not in features_trecho.columns:
+    st.error("Coluna `id_cliente` não encontrada em `cb_previsao_trecho.parquet`.")
+    st.stop()
+
+unique_ids = features_trecho["id_cliente"].unique().tolist()
+fake_names = [fake.name() for _ in unique_ids]
+id_to_name = dict(zip(unique_ids, fake_names))
+name_to_id = dict(zip(fake_names, unique_ids))
+
+# -----------------------------------------------------------------------------
+# Seleção do cliente
+# -----------------------------------------------------------------------------
+selected_fake_name = st.selectbox("Selecione o cliente", sorted(fake_names))
+id_cliente = name_to_id[selected_fake_name]
+
+# -----------------------------------------------------------------------------
+# Previsões
+# -----------------------------------------------------------------------------
+# 1) Dia
+input_dia = features_dia.loc[features_dia["id_cliente"] == id_cliente]
+if input_dia.empty:
+    st.warning("Não há features de data para esse cliente.", icon="⚠️")
+    st.stop()
+
+input_dia = input_dia.drop(columns=["id_cliente"], errors="ignore")
+pred_dia = model_dia.predict(xgb.DMatrix(input_dia))[0]
+data_prevista = dt.date.today() + dt.timedelta(days=int(pred_dia))
+
+# 2) Trecho
+input_trecho = features_trecho.loc[features_trecho["id_cliente"] == id_cliente]
+if input_trecho.empty:
+    st.warning("Não há features de trecho para esse cliente.", icon="⚠️")
+    st.stop()
+
+input_trecho_nid = input_trecho.drop(columns=["id_cliente"], errors="ignore")
+probs = model_trecho.predict(xgb.DMatrix(input_trecho_nid))[0]
+destino_pred_idx = int(np.argmax(probs))
+
+# -----------------------------------------------------------------------------
+# Monta nomes fake de cidades para os trechos
+# -----------------------------------------------------------------------------
+df_compras = df_compras.copy()
+if "origem_ida" not in df_compras.columns or "destino_ida" not in df_compras.columns:
+    st.error("Colunas `origem_ida` e/ou `destino_ida` não existem em `dataframe.parquet`.")
+    st.stop()
+
+df_compras["Trechos"] = df_compras["origem_ida"].astype(str) + "_" + df_compras["destino_ida"].astype(str)
+
+todos_ids = set()
+for item in df_compras["Trechos"]:
+    try:
         origem, destino = item.split("_")
         todos_ids.update([origem, destino])
+    except Exception:
+        continue
 
-    def cidade_fake(i):
-        random.seed(hash(i)); return fake.city()
-    id2city = {i: cidade_fake(i) for i in todos_ids}
+def gerar_cidade_fake(id_unico: str) -> str:
+    random.seed(hash(id_unico))
+    return fake.city()
 
-    def mapear(par):
-        o, d = par.split("_")
-        return f"{id2city[o]} -> {id2city[d]}"
-    return mapear
+id_para_cidade = {i: gerar_cidade_fake(str(i)) for i in todos_ids}
 
-def mostrar_historico(df, mapear):
-    df = df.copy()
-    df["Trechos"] = df["origem_ida"].astype(str) + "_" + df["destino_ida"].astype(str)
-    df["trecho_fake"] = df["Trechos"].apply(mapear)
-    df = df.sort_values("data_compra", ascending=False).copy()
-    df["data_compra"] = pd.to_datetime(df["data_compra"]).dt.strftime("%Y-%m-%d")
-    df = df.rename(columns={
+def mapear_para_cidades(par: str) -> str:
+    try:
+        origem, destino = par.split("_")
+        return f"{id_para_cidade.get(origem, origem)} -> {id_para_cidade.get(destino, destino)}"
+    except Exception:
+        return par
+
+classes = classes.copy()
+if "Trechos" not in classes.columns:
+    st.error("Coluna `Trechos` não existe em `classes.parquet`.")
+    st.stop()
+
+classes["trecho_fake"] = classes["Trechos"].apply(mapear_para_cidades)
+
+# -----------------------------------------------------------------------------
+# Saída principal
+# -----------------------------------------------------------------------------
+st.markdown(
+    f"📅 **Data provável da próxima compra:** `{data_prevista.strftime('%Y-%m-%d')}`"
+)
+try:
+    trecho_prev = classes.iloc[destino_pred_idx]["trecho_fake"]
+except Exception:
+    trecho_prev = "—"
+
+st.markdown(
+    f"🧭 **Trecho provável da próxima compra:** `{trecho_prev}`"
+)
+
+# Métricas do cliente
+cliente_data = df_compras.loc[df_compras["id_cliente"] == id_cliente].copy()
+if cliente_data.empty:
+    st.info("Não há histórico de compras para esse cliente.")
+else:
+    col1, col2, col3 = st.columns(3)
+    # Os campos podem não existir em alguns dumps → usamos get com fallback
+    def _get_first(col, default=0):
+        try:
+            return int(pd.to_numeric(cliente_data[col]).iloc[0])
+        except Exception:
+            return default
+
+    col1.metric("🛒 Quantidade total de compras", _get_first("qtd_total_compras"))
+    col2.metric("📊 Intervalo médio (dias)", _get_first("intervalo_medio_dias"))
+    col3.metric("💳 Valor médio ticket (R$)", _get_first("vl_medio_compra"))
+
+    st.metric("Cluster", str(cliente_data.get("cluster_name", pd.Series(["—"])).iloc[0]))
+
+# -----------------------------------------------------------------------------
+# Histórico
+# -----------------------------------------------------------------------------
+st.subheader("🛒 Histórico de compras do cliente")
+if not cliente_data.empty:
+    cliente_data["trecho_fake"] = cliente_data["Trechos"].apply(mapear_para_cidades)
+    # datas como string
+    if "data_compra" in cliente_data.columns:
+        try:
+            cliente_data["data_compra"] = pd.to_datetime(cliente_data["data_compra"]).dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    rename_cols = {
         "data_compra": "Data",
         "trecho_fake": "Trecho",
-        "qtd_total_compras": "Quantidade de Passageiros",  # ajuste se necessário
-        "vl_medio_compra": "Valor do Ticket (R$)"
-    })
-    st.subheader("🛒 Histórico de compras do cliente")
-    st.dataframe(df[["Data","Trecho","Quantidade de Passageiros","Valor do Ticket (R$)"]],
-                 use_container_width=True)
+        "qnt_passageiros": "Quantidade de Passageiros",
+        "vl_total_compra": "Valor do Ticket (R$)",
+    }
+    cliente_view = cliente_data.rename(columns=rename_cols)
+    cols = [c for c in ["Data", "Trecho", "Quantidade de Passageiros", "Valor do Ticket (R$)"] if c in cliente_view.columns]
+    cliente_view = cliente_view.sort_values(by="Data", ascending=False, ignore_index=True, errors="ignore")
+    st.dataframe(cliente_view[cols], use_container_width=True, hide_index=True)
 
-# =========
-# INTERFACE
-# =========
-with st.sidebar:
-    st.markdown("### Fluxo")
-    st.markdown("1) Selecione um cliente  \n2) Clique em **Iniciar**")
+# -----------------------------------------------------------------------------
+# SHAP (opcional; desliga se faltar memória)
+# -----------------------------------------------------------------------------
+def _plot_shap_for_regression(model: xgb.Booster, X: pd.DataFrame, title: str):
+    if not _HAS_SHAP:
+        st.info("SHAP não disponível neste ambiente.", icon="ℹ️")
+        return
+    try:
+        import shap
+        from matplotlib import pyplot as plt
 
-ids = listar_clientes()
-if not ids:
-    st.error("Nenhum cliente encontrado em `cb_previsao_trecho.parquet`.")
-    st.stop()
+        explainer = shap.Explainer(model)
+        shap_values = explainer(X)
+        st.subheader(title)
+        fig = plt.figure()
+        shap.plots.waterfall(shap_values[0], show=False)
+        st.pyplot(fig, clear_figure=True)
+    except Exception as e:
+        st.warning(f"Não foi possível renderizar SHAP ({e}).", icon="⚠️")
 
-selected_id = st.selectbox("Selecione o cliente", ids, index=0)
-iniciar = st.button("🚀 Iniciar", type="primary")
+def _plot_shap_for_multiclass(model: xgb.Booster, X: pd.DataFrame, class_idx: int, title: str):
+    if not _HAS_SHAP:
+        st.info("SHAP não disponível neste ambiente.", icon="ℹ️")
+        return
+    try:
+        import shap
+        from matplotlib import pyplot as plt
 
-if not iniciar:
-    st.info("Pronto para iniciar. Selecione um cliente e clique em **Iniciar**.")
-    st.stop()
+        explainer = shap.Explainer(model)
+        shap_values = explainer(X)
+        shap_value_classe = shap_values[0, :, class_idx]
+        st.subheader(title)
+        fig = plt.figure()
+        shap.plots.waterfall(shap_value_classe, show=False)
+        st.pyplot(fig, clear_figure=True)
+    except Exception as e:
+        st.warning(f"Não foi possível renderizar SHAP ({e}).", icon="⚠️")
 
-with st.status("Carregando modelos e dados...", expanded=True):
-    modelo_dia, modelo_destino = carregar_modelos()
-    st.write("✔️ Modelos carregados")
-
-    features_dia, features_trecho = carregar_features_cliente(selected_id)
-    if features_dia.empty or features_trecho.empty:
-        st.error("Não há features para esse cliente. Tente outro.")
-        st.stop()
-    st.write("✔️ Features do cliente carregadas")
-
-    df_compras = carregar_compras_cliente(selected_id)
-    if df_compras.empty:
-        st.warning("Cliente sem histórico em `dataframe.parquet`.")
-    else:
-        st.write("✔️ Histórico do cliente carregado")
-
-    classes = carregar_classes_slim()
-    st.write("✔️ Classes carregadas")
-
-# =============
-# PREVISÕES
-# =============
-try:
-    X_dia = features_dia[features_dia["id_cliente"] == selected_id].drop(columns=["id_cliente"], errors="ignore")
-    dmx_dia = xgb.DMatrix(X_dia)
-    data_prevista = modelo_dia.predict(dmx_dia)[0]
-
-    X_tre = features_trecho[features_trecho["id_cliente"] == selected_id].drop(columns=["id_cliente"], errors="ignore")
-    dmx_tre = xgb.DMatrix(X_tre)
-    probs = modelo_destino.predict(dmx_tre)[0]
-    destino_pred = int(np.argmax(probs))
-
-    mapear = gerar_mapeamento_cidades(df_compras if not df_compras.empty else
-                                      pd.DataFrame({"origem_ida":[],"destino_ida":[]}))
-    classes = classes.copy()
-    classes["trecho_fake"] = classes["Trechos"].apply(mapear)
-
-    data_final = datetime.date.today() + datetime.timedelta(days=int(data_prevista))
-    st.success(f"📅 **Data provável da próxima compra:** {data_final:%Y-%m-%d}")
-    st.info(f"🧭 **Trecho provável:** {classes.iloc[destino_pred]['trecho_fake']}")
-
-    if not df_compras.empty:
-        row = df_compras.iloc[0]
-        c1, c2, c3 = st.columns(3)
-        c1.metric("🛒 Quantidade total de compras", int(row["qtd_total_compras"]))
-        c2.metric("📊 Intervalo médio (dias)", int(row["intervalo_medio_dias"]))
-        c3.metric("💵 Valor médio ticket (R$)", int(row["vl_medio_compra"]))
-        st.metric("Cluster", str(row["cluster_name"]))
-        mostrar_historico(df_compras, mapear)
-
-except FileNotFoundError as e:
-    st.error(f"Arquivo não encontrado: {e}")
-    st.stop()
-except Exception as e:
-    st.error(f"Falha ao gerar previsões: {e}")
-    st.stop()
+# Para ambientes com pouca RAM, as chamadas abaixo podem ser comentadas.
+_plot_shap_for_regression(model_dia, input_dia, "🔍 Explicação da previsão da **data** (SHAP)")
+_plot_shap_for_multiclass(model_trecho, input_trecho_nid, destino_pred_idx, "🔍 Explicação da previsão do **trecho** (SHAP)")
